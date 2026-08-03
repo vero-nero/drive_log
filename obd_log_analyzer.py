@@ -935,13 +935,27 @@ class OBDAnalyzerApp(tk.Tk):
         if not self.result:
             messagebox.showinfo("No data", "Open a CSV log first.")
             return
+        exports_dir = Path(__file__).parent / "exports"
+        try:
+            exports_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
         initial = self.result.source.with_suffix(".html").name
-        filename = filedialog.asksaveasfilename(title="Export HTML report", defaultextension=".html", initialfile=initial, filetypes=[("HTML report", "*.html")])
+        filename = filedialog.asksaveasfilename(
+            title="Export HTML report",
+            defaultextension=".html",
+            initialfile=initial,
+            initialdir=str(exports_dir),
+            filetypes=[("HTML report", "*.html")],
+        )
         if not filename:
             return
         try:
-            create_html_report(self.result, Path(filename))
-            messagebox.showinfo("Report exported", f"Saved report to:\n{filename}")
+            out_path = Path(filename)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            create_html_report(self.result, out_path)
+            messagebox.showinfo("Report exported", f"Saved report to:\n{out_path}")
         except Exception as exc:
             messagebox.showerror("Export failed", str(exc))
 
@@ -1007,8 +1021,16 @@ def main() -> int:
             return 2
         try:
             result = analyze_file(args.csv_file, thresholds)
-            create_html_report(result, args.report)
-            print(f"Report written to {args.report}")
+            report_path = Path(args.report)
+            # If the passed report path has no parent (just a filename) write to exports/ by default.
+            if report_path.parent in (Path("."), Path("")):
+                exports_dir = Path(__file__).parent / "exports"
+                exports_dir.mkdir(parents=True, exist_ok=True)
+                report_path = exports_dir / report_path.name
+            else:
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+            create_html_report(result, report_path)
+            print(f"Report written to {report_path}")
             return 0
         except Exception as exc:
             print(f"Error: {exc}", file=sys.stderr)
