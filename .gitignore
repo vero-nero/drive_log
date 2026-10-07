@@ -1,3 +1,2 @@
-# Ignore generated export reports and other export artifacts
 exports/
-/exports/
+__pycache__/

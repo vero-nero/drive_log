@@ -71,6 +71,9 @@ class Thresholds:
     warning_combined_trim_abs: float = 20.0
     critical_combined_trim_abs: float = 30.0
     warning_rpm: float = 6500.0
+    warning_oil_c: float = 130.0
+    low_charging_v: float = 12.8
+    critical_charging_v: float = 15.2
     lean_lambda: float = 1.05
     critical_lean_lambda: float = 1.10
 
@@ -98,6 +101,15 @@ ALIASES: dict[str, tuple[str, ...]] = {
         "lambda b1s1",
         "lambda",
     ),
+    "stft_b2": ("short-term fuel trim bank 2", "short term fuel trim bank 2", "stft bank 2"),
+    "ltft_b2": ("long-term fuel trim bank 2", "long term fuel trim bank 2", "ltft bank 2"),
+    "voltage": ("control module voltage", "module voltage", "battery voltage"),
+    "oil_temp": ("engine oil temperature", "oil temperature"),
+    "ambient": ("ambient air temperature", "ambient temperature"),
+    "fuel_rail": ("fuel rail gauge pressure", "fuel rail absolute pressure",
+                  "fuel rail pressure relative to manifold", "fuel rail pressure"),
+    "fuel_level": ("fuel tank level", "fuel level"),
+    "baro": ("absolute barometric pressure", "barometric pressure", "baro"),
     "boost_kpa": ("derived boost relative to atmosphere (kpa)", "boost kpa", "boost pressure kpa"),
     "boost_bar": ("derived boost relative to atmosphere (bar)", "boost bar", "boost pressure bar"),
     "combined_trim": ("combined fuel trim bank 1 (%)", "combined fuel trim bank 1", "combined fuel trim"),
@@ -119,6 +131,13 @@ DISPLAY_NAMES = {
     "timing": "Ignition timing advance",
     "lambda": "Wideband lambda B1S1",
     "o2_b1s2_v": "O2 voltage B1S2",
+    "stft_b2": "Short-term fuel trim B2",
+    "ltft_b2": "Long-term fuel trim B2",
+    "voltage": "Module voltage",
+    "oil_temp": "Engine oil temperature",
+    "ambient": "Ambient air temperature",
+    "fuel_rail": "Fuel rail pressure",
+    "fuel_level": "Fuel tank level",
 }
 
 UNITS = {
@@ -137,6 +156,13 @@ UNITS = {
     "timing": "°",
     "lambda": "λ",
     "o2_b1s2_v": "V",
+    "stft_b2": "%",
+    "ltft_b2": "%",
+    "voltage": "V",
+    "oil_temp": "°C",
+    "ambient": "°C",
+    "fuel_rail": "kPa",
+    "fuel_level": "%",
 }
 
 
@@ -237,6 +263,7 @@ def prepare_data(raw: pd.DataFrame, thresholds: Thresholds) -> tuple[pd.DataFram
     numeric_keys = (
         "load", "coolant", "stft", "ltft", "map", "rpm", "speed", "timing",
         "iat", "maf", "throttle", "boost_kpa", "boost_bar", "combined_trim",
+        "stft_b2", "ltft_b2", "voltage", "oil_temp", "ambient", "fuel_rail", "fuel_level", "baro",
     )
     for key in numeric_keys:
         if key in mapping:
@@ -252,14 +279,18 @@ def prepare_data(raw: pd.DataFrame, thresholds: Thresholds) -> tuple[pd.DataFram
         data["_o2_b1s2_v"] = extract_number(source, r"([-+]?\d+(?:[\.,]\d+)?)\s*V")
         data["_o2_b1s2_trim"] = extract_number(source, r"trim\s*([-+]?\d+(?:[\.,]\d+)?)")
 
-    # Prefer a logged boost value. Derive it from absolute MAP when absent.
+    # Prefer a logged boost value. Derive it from absolute MAP when absent,
+    # using the logged barometric pressure when available.
+    atmosphere: object = thresholds.atmospheric_kpa
+    if "_baro" in data and data["_baro"].notna().any():
+        atmosphere = data["_baro"].ffill().bfill()
     if "_boost_bar" not in data or data["_boost_bar"].notna().sum() == 0:
         if "_map" in data:
-            data["_boost_bar"] = (data["_map"] - thresholds.atmospheric_kpa) / 100.0
-            data["_boost_source"] = "Derived from MAP"
+            data["_boost_bar"] = (data["_map"] - atmosphere) / 100.0
+            data["_boost_source"] = "Derived from MAP and logged BARO" if "_baro" in data else "Derived from MAP"
     else:
         if "_map" in data:
-            derived = (data["_map"] - thresholds.atmospheric_kpa) / 100.0
+            derived = (data["_map"] - atmosphere) / 100.0
             data["_boost_bar"] = data["_boost_bar"].fillna(derived)
         data["_boost_source"] = "Logged/derived"
 
@@ -345,6 +376,25 @@ def evaluate_events(data: pd.DataFrame, mapping: dict[str, str], t: Thresholds) 
                    "Warning", "LTFT B1", "_ltft",
                    f"Absolute long-term fuel trim reached at least {t.warning_ltft_abs:.0f} %.")
 
+    ltft_b2 = col("_ltft_b2").abs()
+    add_event_rows(rows, data, ltft_b2 >= t.critical_ltft_abs, "Critical", "LTFT B2", "_ltft_b2",
+                   f"Absolute long-term fuel trim reached at least {t.critical_ltft_abs:.0f} %.")
+    add_event_rows(rows, data, (ltft_b2 >= t.warning_ltft_abs) & (ltft_b2 < t.critical_ltft_abs),
+                   "Warning", "LTFT B2", "_ltft_b2",
+                   f"Absolute long-term fuel trim reached at least {t.warning_ltft_abs:.0f} %.")
+
+    oil = col("_oil_temp")
+    add_event_rows(rows, data, oil >= t.warning_oil_c, "Warning", "Engine oil temperature", "_oil_temp",
+                   f"Engine oil temperature reached at least {t.warning_oil_c:.0f} °C.")
+
+    # Charging system: judge only while the engine is clearly running.
+    voltage = col("_voltage")
+    running = col("_rpm") >= 600
+    add_event_rows(rows, data, voltage >= t.critical_charging_v, "Critical", "Module voltage", "_voltage",
+                   f"System voltage reached at least {t.critical_charging_v:.1f} V (possible overcharging).")
+    add_event_rows(rows, data, running & (voltage < t.low_charging_v), "Warning", "Module voltage", "_voltage",
+                   f"System voltage below {t.low_charging_v:.1f} V with the engine running (alternator not charging?).")
+
     closed_loop = pd.Series(True, index=data.index)
     if "fuel_status" in mapping:
         closed_loop = data[mapping["fuel_status"]].astype(str).str.contains("closed loop", case=False, na=False)
@@ -416,6 +466,13 @@ def calculate_quality(data: pd.DataFrame, mapping: dict[str, str]) -> list[str]:
     if "_boost_source" in data and data["_boost_source"].iloc[0] == "Derived from MAP":
         messages.append("Boost was calculated from MAP using the configured atmospheric pressure.")
 
+    if "monitor" in mapping:
+        status = data[mapping["monitor"]].astype(str)
+        not_ready = extract_number(status, r"(\d+)\s*monitor")
+        if not_ready.notna().any() and not_ready.iloc[-1] > 0:
+            messages.append(f"{int(not_ready.iloc[-1])} readiness monitor(s) not complete at the end of the log "
+                            "(normal shortly after clearing codes; an emissions test may fail).")
+
     for key in ("_rpm", "_speed", "_coolant", "_iat", "_map", "_maf", "_throttle", "_lambda"):
         if key in data:
             valid = data[key].dropna()
@@ -442,7 +499,8 @@ def calculate_summary(data: pd.DataFrame, mapping: dict[str, str], events: pd.Da
         "warning_events": int((events["Severity"] == "Warning").sum()) if not events.empty else 0,
     }
 
-    for key in ("rpm", "speed", "coolant", "iat", "load", "stft", "ltft", "combined_trim", "map", "boost_bar", "maf", "throttle", "timing", "lambda"):
+    for key in ("rpm", "speed", "coolant", "iat", "load", "stft", "ltft", "combined_trim", "map", "boost_bar",
+                "maf", "throttle", "timing", "lambda", "stft_b2", "ltft_b2", "voltage", "oil_temp", "fuel_rail"):
         column = f"_{key}"
         if column in data and data[column].notna().any():
             summary[f"{key}_min"] = float(data[column].min())
@@ -493,20 +551,25 @@ def fmt(value: object, decimals: int = 1, suffix: str = "") -> str:
 
 
 def available_series(data: pd.DataFrame) -> list[str]:
-    order = ["rpm", "speed", "coolant", "iat", "load", "throttle", "map", "boost_bar", "maf", "timing", "stft", "ltft", "combined_trim", "lambda", "o2_b1s2_v"]
+    order = ["rpm", "speed", "coolant", "iat", "oil_temp", "ambient", "load", "throttle", "map", "boost_bar", "maf",
+             "timing", "stft", "ltft", "combined_trim", "stft_b2", "ltft_b2", "lambda", "o2_b1s2_v", "voltage",
+             "fuel_rail", "fuel_level"]
     return [key for key in order if f"_{key}" in data and data[f"_{key}"].notna().any()]
 
 
 CHART_PRESETS: dict[str, tuple[list[str], list[str]]] = {
     "Driving overview": (["rpm"], ["speed", "throttle"]),
-    "Temperatures": (["coolant", "iat"], []),
+    "Temperatures": (["coolant", "iat", "oil_temp", "ambient"], []),
     "Fuel trims": (["stft", "ltft", "combined_trim"], []),
+    "Fuel trims bank 2": (["stft_b2", "ltft_b2"], []),
+    "Electrical": (["voltage"], ["rpm"]),
+    "Fuel system": (["fuel_rail"], ["fuel_level"]),
     "Air and boost": (["maf"], ["map", "boost_bar"]),
     "Lambda and timing": (["lambda"], ["timing"]),
     "Load and throttle": (["load", "throttle"], []),
 }
 
-PLOT_COLORS = [COLORS["blue"], COLORS["amber"], COLORS["slate"], COLORS["green"]]
+PLOT_COLORS = [COLORS["blue"], COLORS["amber"], COLORS["slate"], COLORS["green"], COLORS["red"]]
 
 
 def plot_preset(figure: Figure, result: AnalysisResult, preset: str, smoothing: int = 1) -> None:
@@ -569,7 +632,9 @@ def figure_to_base64(figure: Figure) -> str:
 def create_html_report(result: AnalysisResult, output: Path) -> None:
     summary = result.summary
     chart_images: list[tuple[str, str]] = []
-    for preset in CHART_PRESETS:
+    for preset, (left, right) in CHART_PRESETS.items():
+        if not any(f"_{key}" in result.data and result.data[f"_{key}"].notna().any() for key in left + right):
+            continue
         fig = Figure(figsize=(10.5, 4.2), dpi=100)
         plot_preset(fig, result, preset, smoothing=1)
         chart_images.append((preset, figure_to_base64(fig)))
@@ -858,6 +923,11 @@ class OBDAnalyzerApp(tk.Tk):
         critical = int(s.get("critical_events", 0))
         warning = int(s.get("warning_events", 0))
         lines = [f"Critical findings: {critical}", f"Warnings: {warning}"]
+        if "mil_on" in s:
+            lines.append(f"MIL: {'ON at some point' if s['mil_on'] else 'off'}; "
+                         f"highest DTC count: {s.get('max_dtc_count', 0)}")
+        if "voltage_min" in s and "voltage_max" in s:
+            lines.append(f"Module voltage range: {s['voltage_min']:.2f} to {s['voltage_max']:.2f} V")
         if "closed_loop_pct" in s:
             lines.append(f"Closed-loop samples: {s['closed_loop_pct']:.1f} %")
         if "ltft_max" in s and "ltft_min" in s:
@@ -979,6 +1049,9 @@ class OBDAnalyzerApp(tk.Tk):
             ("LTFT warning absolute (%)", "warning_ltft_abs"),
             ("LTFT critical absolute (%)", "critical_ltft_abs"),
             ("RPM warning", "warning_rpm"),
+            ("Oil temperature warning (°C)", "warning_oil_c"),
+            ("Low charging voltage (V)", "low_charging_v"),
+            ("Overcharging voltage (V)", "critical_charging_v"),
         ]
         variables: dict[str, tk.StringVar] = {}
         for row, (label, attribute) in enumerate(fields):
